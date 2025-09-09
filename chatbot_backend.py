@@ -325,6 +325,15 @@ def chat(query: Query):
     return {"answer": answer}
 
 
+@app.get("/")
+def root():
+    return {"message": "Chatbot API is running 🚀"}
+
+@app.get("/favicon.ico")
+def favicon():
+    # Optional: prevents noisy 404s in logs
+    return {"ok": True}
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -342,6 +351,13 @@ def debug_content():
         "sample_chunks": sample_chunks,
         "chunk_previews": [chunk[:200] + "..." if len(chunk) > 200 else chunk for chunk in sample_chunks]
     }
+@app.get("/")
+def root():
+    return {"message": "Chatbot API is running 🚀"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.get("/debug/search")
 def debug_search(query: str):
