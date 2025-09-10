@@ -416,7 +416,7 @@ def debug_content():
         "sample_chunks": sample_chunks,
         "chunk_previews": [chunk[:200] + "..." if len(chunk) > 200 else chunk for chunk in sample_chunks]
     }
- 
+
 
 @app.get("/debug/search")
 def debug_search(query: str):
