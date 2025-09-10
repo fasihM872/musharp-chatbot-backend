@@ -32,21 +32,26 @@ class GeminiResponder:
         return chunks
 
     def load_wordpress_site(self, chunk_size=1500, overlap=150):
-        """Fetch ALL content from WordPress REST API and clean them"""
+        """Fetch ALL content from WordPress REST API (with pagination) and clean them"""
         try:
             all_texts = []
             
-            # 1. Fetch Pages
+            # 1. Fetch Pages (paginate)
             print("📄 Fetching pages...")
-            pages_url = f"{self.site_url}/wp-json/wp/v2/pages?per_page=100"
+            page_num = 1
+            while True:
+                pages_url = f"{self.site_url}/wp-json/wp/v2/pages?per_page=100&page={page_num}"
             pages_response = requests.get(
                 pages_url,
-                timeout=10,
+                    timeout=15,
                 headers={"User-Agent": "MusharpChatbotBot/1.0"},
             )
+                if pages_response.status_code == 400 and 'rest_post_invalid_page_number' in pages_response.text:
+                    break
             pages_response.raise_for_status()
             pages = pages_response.json()
-            
+                if not pages:
+                    break
             for page in pages:
                 title = page.get("title", {}).get("rendered", "")
                 content = page.get("content", {}).get("rendered", "")
@@ -55,18 +60,24 @@ class GeminiResponder:
                 combined = f"PAGE: {title}\nSlug: {slug}\nExcerpt: {excerpt}\nContent: {content}"
                 clean_text = re.sub(r"<[^>]+>", "", combined)
                 all_texts.append(clean_text.strip())
+                page_num += 1
 
-            # 2. Fetch Posts (Blogs)
+            # 2. Fetch Posts (Blogs) (paginate)
             print("📝 Fetching blog posts...")
-            posts_url = f"{self.site_url}/wp-json/wp/v2/posts?per_page=100"
+            post_page = 1
+            while True:
+                posts_url = f"{self.site_url}/wp-json/wp/v2/posts?per_page=100&page={post_page}"
             posts_response = requests.get(
                 posts_url,
-                timeout=10,
+                    timeout=15,
                 headers={"User-Agent": "MusharpChatbotBot/1.0"},
             )
+                if posts_response.status_code == 400 and 'rest_post_invalid_page_number' in posts_response.text:
+                    break
             posts_response.raise_for_status()
             posts = posts_response.json()
-            
+                if not posts:
+                    break
             for post in posts:
                 title = post.get("title", {}).get("rendered", "")
                 content = post.get("content", {}).get("rendered", "")
@@ -74,7 +85,6 @@ class GeminiResponder:
                 slug = post.get("slug", "")
                 date = post.get("date", "")
                 categories = post.get("categories", [])
-                tags = post.get("tags", [])
                 
                 # Get category names
                 cat_names = []
@@ -91,6 +101,7 @@ class GeminiResponder:
                 combined = f"BLOG POST: {title}\nSlug: {slug}\nDate: {date}\nCategories: {', '.join(cat_names)}\nExcerpt: {excerpt}\nContent: {content}"
                 clean_text = re.sub(r"<[^>]+>", "", combined)
                 all_texts.append(clean_text.strip())
+                post_page += 1
 
             # 3. Fetch Custom Post Types (if any)
             print("🔧 Fetching custom content...")
@@ -234,23 +245,65 @@ class GeminiResponder:
         
         # Sort by score and return top chunks
         scored.sort(reverse=True, key=lambda x: x[0])
-        return [chunk for _, chunk in scored[:max_chunks] if _ > 0]
+        return [chunk for score, chunk in scored[:max_chunks] if score > 0]
+
+    def _max_relevance_score(self, query):
+        """Compute a rough max relevance score across chunks for gating."""
+        if not self.knowledge_chunks:
+            return 0
+        query_lower = query.lower()
+        query_words = set(query_lower.split())
+        contact_keywords = ['contact', 'email', 'phone', 'address', 'location', 'office', 'reach', 'get in touch']
+        is_contact_query = any(keyword in query_lower for keyword in contact_keywords)
+        best = 0
+        for chunk in self.knowledge_chunks:
+            chunk_lower = chunk.lower()
+            chunk_words = set(chunk_lower.split())
+            word_matches = len(query_words.intersection(chunk_words))
+            exact_phrase_score = 10 if query_lower in chunk_lower else 0
+            content_type_boost = 3 if chunk.startswith("BLOG POST:") else (2 if chunk.startswith("PAGE:") else (1 if chunk.startswith("MENU:") else 0))
+            contact_boost = 0
+            if is_contact_query:
+                if any(keyword in chunk_lower for keyword in contact_keywords):
+                    contact_boost = 5
+                if chunk.startswith("MENU:") and any(keyword in chunk_lower for keyword in ['contact', 'about', 'reach']):
+                    contact_boost = 8
+            score = word_matches + exact_phrase_score + content_type_boost + contact_boost
+            if score > best:
+                best = score
+        return best
 
     def generate_response(self, user_input):
-        """Generate chatbot reply using Gemini with website context"""
-        if not self.knowledge_chunks:
-            context = "This website content could not be loaded. Please check again."
-        else:
-            relevant_chunks = self._find_relevant_chunks(user_input)
-            context = "\n".join(relevant_chunks)
+        """Generate chatbot reply with small-talk, site context, and general fallback."""
+        user_lower = user_input.lower().strip()
 
-        # Add fallback contact information if contact is asked but not found
-        user_lower = user_input.lower()
-        if any(keyword in user_lower for keyword in ['contact', 'email', 'phone', 'address', 'location', 'office', 'reach']):
-            if not any(keyword in context.lower() for keyword in ['contact', 'email', 'phone', 'address', 'location', 'office']):
-                context += "\n\nFALLBACK CONTACT INFO: For contact information, please visit the muSharp website directly or check the contact page. You can also reach out through the website's contact form or social media channels."
+        # Small-talk
+        if re.search(r"\b(hi|hello|hey)\b", user_lower):
+            return "Hi! How can I help you?"
+        if "how are you" in user_lower:
+            return "I'm doing great and ready to help. What can I do for you today?"
 
-        prompt = f"""
+        # Gather context and relevance
+        relevant_chunks = self._find_relevant_chunks(user_input) if self.knowledge_chunks else []
+        context = "\n".join(relevant_chunks) if relevant_chunks else ""
+        relevance = self._max_relevance_score(user_input)
+
+        # Contact fallback
+        if any(k in user_lower for k in ['contact', 'email', 'phone', 'address', 'location', 'office', 'reach']):
+            if not context or not any(k in context.lower() for k in ['contact', 'email', 'phone', 'address', 'location', 'office']):
+                context += "\n\nFALLBACK CONTACT INFO: Please check the website's Contact page for the latest contact details."
+
+        try:
+            if not context.strip() or relevance <= 0:
+                # Out-of-site or no match → general helpful answer
+                general_prompt = f"""
+                You are a helpful assistant. Answer the user's question concisely and accurately.
+
+                User Question: {user_input}
+                """
+                response = self.model.generate_content(general_prompt)
+            else:
+                site_prompt = f"""
         You are a helpful assistant for muSharp's website. Answer the user's question using ONLY the information provided in the context below.
 
         Context from website:
@@ -265,9 +318,8 @@ class GeminiResponder:
         - Be direct and concise
         - Don't add extra information or suggestions unless specifically asked
         """
+                response = self.model.generate_content(site_prompt)
 
-        try:
-            response = self.model.generate_content(prompt)
             response_text = getattr(response, "text", None)
             if not response_text:
                 return "I couldn't generate a response right now. Please try again."
@@ -325,8 +377,21 @@ def chat(query: Query):
     return {"answer": answer}
 
 
+@app.get("/chat")
+def chat_get(message: str = "", query: str = ""):
+    user_message = message or query
+    if not user_message:
+        raise HTTPException(status_code=400, detail="Empty message")
+    answer = responder.generate_response(user_message)
+    return {"answer": answer}
+
 @app.get("/")
-def root():
+def root(message: str = "", query: str = ""):
+    # If message is provided as a query param, answer directly (GET fallback)
+    user_message = message or query
+    if user_message:
+        answer = responder.generate_response(user_message)
+        return {"answer": answer}
     return {"message": "Chatbot API is running 🚀"}
 
 @app.get("/favicon.ico")
@@ -351,13 +416,7 @@ def debug_content():
         "sample_chunks": sample_chunks,
         "chunk_previews": [chunk[:200] + "..." if len(chunk) > 200 else chunk for chunk in sample_chunks]
     }
-@app.get("/")
-def root():
-    return {"message": "Chatbot API is running 🚀"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+ 
 
 @app.get("/debug/search")
 def debug_search(query: str):
